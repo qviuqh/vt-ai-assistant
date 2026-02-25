@@ -1,0 +1,126 @@
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+*.lnk
+
+# Logs and runtime data
+*.log
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.pid
+*.seed
+*.pid.lock
+
+# Environment and secrets
+.env
+.env.*
+.env.local
+.envrc
+*.pem
+*.key
+*.crt
+*.cer
+*.csr
+*.p12
+*.jks
+*.asc
+*.gpg
+
+# Python
+__pycache__/
+.py[cod]
+*$py.class
+*.so
+*.dylib
+*.pyd
+venv/
+.venv/
+ENV/
+env/
+nora-env/
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+python_modules/
+*.egg-info/
+build/
+dist/
+*.egg
+*.whl
+*.pytest_cache/
+.pytest_cache/
+coverage/
+htmlcov/
+*.cover
+.coverage
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+*.nbconvert.ipynb
+
+# Node & frontend
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tgz
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+.eslintcache
+.npm
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+.history/
+*.swp
+*.swo
+
+# Build and documentation outputs
+docs/_build/
+build/
+dist/
+*.egg-info/
+*.log
+coverage/
+*.cache
+
+# Data, experiments & artifacts
+data/
+experiments/
+results/
+evaluation/
+notebooks/
+thesis_artifacts/
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.h5
+*.pkl
+*.parquet
+*.feather
+*.csv
+*.tsv
+*.jsonl
+
+# Misc
+*.bak
+*.tmp
+*.tmpdir
+*.orig
+*.out
+*.backup
+
+# test.ipynb
+test.ipynb
