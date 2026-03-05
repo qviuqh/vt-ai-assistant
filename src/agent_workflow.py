@@ -310,12 +310,22 @@ class DifyAgent(AgentWorkflow):
 
     PLATFORM = "dify"
     DEFAULT_BASE_URL = "https://api.dify.ai/v1"
+    _conversation_by_session: Dict[str, str] = {}
 
     def __init__(self, access_token: str = ""):
         super().__init__(self.PLATFORM, access_token=access_token)
         self.base_url = os.getenv("DIFY_API_URL", self.DEFAULT_BASE_URL).rstrip("/")
         self.api_key = os.getenv("DIFY_API_KEY", "")
         self.user = os.getenv("DIFY_USER", "streamlit-user")
+
+    @classmethod
+    def _get_cached_conversation_id(cls, session_id: str) -> str:
+        return cls._conversation_by_session.get(session_id, "")
+
+    @classmethod
+    def _cache_conversation_id(cls, session_id: str, conversation_id: Optional[str]) -> None:
+        if session_id and conversation_id:
+            cls._conversation_by_session[session_id] = conversation_id
 
     def _headers(self) -> Dict[str, str]:
         return self._with_access_token_header({
@@ -366,36 +376,65 @@ class DifyAgent(AgentWorkflow):
 
     def process_response(self, response: requests.Response, **kwargs) -> str:
         data = response.json()
+        session_id = kwargs.get("session_id", "")
+        self._cache_conversation_id(session_id, data.get("conversation_id"))
         return data.get("answer") or data.get("message") or json.dumps(data)
 
     def stream_response(self, query: str, session_id: str) -> Generator[str, None, None]:
+        # sourcery skip: merge-comparisons, merge-duplicate-blocks, remove-redundant-if
         if not self.api_key:
             yield "⚠️ DIFY_API_KEY is not configured."
             return
         try:
-            resp = self.send_request(query, session_id, stream=True)
+            conversation_id = self._get_cached_conversation_id(session_id)
+            resp = self.send_request(
+                query,
+                session_id,
+                conversation_id=conversation_id,
+                stream=True,
+            )
             for raw_line in resp.iter_lines():
                 if not raw_line:
                     continue
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                line = (
+                    raw_line.decode("utf-8", errors="replace")
+                    if isinstance(raw_line, bytes)
+                    else raw_line
+                )
+                if (
+                    line.startswith("event:")
+                    or line.startswith("id:")
+                    or line.startswith("retry:")
+                    or line.startswith(":")
+                ):
+                    continue
                 if line.startswith("data:"):
                     line = line[5:].strip()
-                if line == "[DONE]" or not line:
+                if line == "[DONE]" or not line or line.lower() == "ping":
                     continue
                 try:
                     chunk = json.loads(line)
+                    self._cache_conversation_id(session_id, chunk.get("conversation_id"))
                     event = chunk.get("event", "")
                     if event == "message":
-                        yield chunk.get("answer", "")
+                        answer = chunk.get("answer", "")
+                        if answer:
+                            yield answer
                     elif event == "agent_message":
-                        yield chunk.get("answer", "")
-                    elif event == "message_end":
+                        answer = chunk.get("answer", "")
+                        if answer:
+                            yield answer
+                    elif event in ("message_end", "agent_message_end"):
                         break
                     elif event == "error":
                         yield f"\n⚠️ {chunk.get('message', 'Unknown error')}"
                         break
+                    elif not event:
+                        answer = chunk.get("answer", "")
+                        if answer:
+                            yield answer
                 except ValueError:
-                    yield line
+                    continue
         except requests.exceptions.RequestException as exc:
             yield f"⚠️ Request failed: {exc}"
 
@@ -501,7 +540,6 @@ class LangFlowAgent(AgentWorkflow):
         except requests.exceptions.RequestException as exc:
             yield f"⚠️ Request failed: {exc}"
 
-
 # ---------------------------------------------------------------------------
 # Flowise
 # ---------------------------------------------------------------------------
@@ -515,6 +553,8 @@ class FlowiseAgent(AgentWorkflow):
         FLOWISE_CHATFLOW_ID  – chatflow UUID (required)
         FLOWISE_API_KEY      – optional bearer token
     """
+    
+
 
     PLATFORM = "flowise"
 
@@ -545,11 +585,12 @@ class FlowiseAgent(AgentWorkflow):
     def health_check(self) -> Dict[str, Any]:
         if not self.chatflow_id:
             return self._missing_config_result(self.base_url, ["FLOWISE_CHATFLOW_ID"])
-        url = f"{self.base_url}/api/v1/chatflows/{self.chatflow_id}"
+        url = f"{self.base_url}/chatflows/{self.chatflow_id}/health"
         return self._health_check_request(url, headers=self._headers())
 
     def send_request(self, query: str, session_id: str, chat_history: list = None) -> requests.Response:
         url = f"{self.base_url}/api/v1/prediction/{self.chatflow_id}"
+        # url = f"{self.base_url}/prediction/{self.chatflow_id}"
         payload = {
             "question": query,
             "sessionId": session_id,
@@ -563,7 +604,7 @@ class FlowiseAgent(AgentWorkflow):
             url,
             json=payload,
             headers=self._headers(),
-            timeout=60,
+            timeout=120,
             stream=True,
         )
         response.raise_for_status()
@@ -594,8 +635,19 @@ class FlowiseAgent(AgentWorkflow):
                     if not raw_line:
                         continue
                     line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                    if (
+                        line.startswith("event:")
+                        or line.startswith("id:")
+                        or line.startswith("retry:")
+                        or line.startswith(":")
+                    ):
+                        continue
                     if line.startswith("data:"):
                         line = line[5:].strip()
+                    if ":" in line:
+                        prefix, rest = line.split(":", 1)
+                        if prefix.strip().lower() in ("message", "token"):
+                            line = rest.strip()
                     if not line or line == "[DONE]":
                         continue
                     try:
@@ -609,7 +661,8 @@ class FlowiseAgent(AgentWorkflow):
                             yield f"\n⚠️ {chunk.get('data', 'Unknown error')}"
                             break
                     except ValueError:
-                        yield line
+                        if line.lower() not in ("message", "token"):
+                            yield line
             else:
                 yield self.process_response(resp)
         except requests.exceptions.RequestException as exc:

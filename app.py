@@ -7,6 +7,13 @@ import datetime
 import time
 
 import streamlit as st
+import os
+import json
+import hashlib
+import logging
+import urllib.request
+import urllib.error
+from typing import Optional
 
 st.set_page_config(page_title="AI Agent", layout="wide")
 
@@ -14,22 +21,23 @@ MIN_TIME_BETWEEN_REQUESTS = datetime.timedelta(seconds=1)
 PROCESSING_TIMEOUT_SECONDS = 300
 
 SUGGESTIONS = {
-    ":blue[:material/local_library:] What is Streamlit?": (
-        "What is Streamlit, what is it great at, and what can I do with it?"
+    ":blue[:material/local_library:] Lịch trình hôm nay": (
+        "Lịch trình hôm nay của tôi như thế nào?"
     ),
     ":green[:material/database:] Help me understand session state": (
         "Help me understand session state. What is it for? "
         "What are gotchas? What are alternatives?"
     ),
-    ":orange[:material/multiline_chart:] How do I make an interactive chart?": (
-        "How do I make a chart where, when I click, another chart updates? "
-        "Show me examples with Altair or Plotly."
+    ":orange[:material/multiline_chart:] Tạo lịch họp sáng nay": (
+        "Tạo một lịch họp cho buổi sáng nay"
     ),
-    ":violet[:material/apparel:] How do I customize my app?": (
-        "How do I customize my app? What does Streamlit offer? No hacks please."
+    ":violet[:material/apparel:] Lịch trình tuần này": (
+        "Lịch trình tuần này của tôi như thế nào?"
     ),
-    ":red[:material/deployed_code:] Deploying an app at work": (
-        "How do I deploy an app at work? Give me easy and performant options."
+    ":red[:material/deployed_code:] Thông tin chung về Viettel": (
+        "Cho tôi biết thông tin chung về tập đoàn Viettel?"
+        "Viettel được thành lập khi nào?"
+        "Viettel hoạt động trên bao nhiêu Quốc gia?"
     ),
 }
 
@@ -38,9 +46,11 @@ def ensure_session_state():
     defaults = {
         "is_processing": False,
         "processing_started_at": None,
+        "pending_user_message": None,
         "messages": [],
         "agent_connection_cache": {},
         "_last_checked_agent_id": None,
+        "_last_conversation_agent_id": None,
         "session_id": generate_session_id(),
         "prev_question_timestamp": datetime.datetime.fromtimestamp(0),
         "selected_agent_id": None,
@@ -55,7 +65,20 @@ def clear_conversation():
     st.session_state.messages = []
     st.session_state.initial_question = None
     st.session_state.selected_suggestion = None
+    st.session_state.pending_user_message = None
+    st.session_state.is_processing = False
+    st.session_state.processing_started_at = None
     st.session_state.session_id = generate_session_id()
+
+
+def handle_agent_platform_change():
+    selected_agent_id = st.session_state.get("selected_agent_id")
+    previous_agent_id = st.session_state.get("_last_conversation_agent_id")
+
+    if previous_agent_id and previous_agent_id != selected_agent_id:
+        clear_conversation()
+
+    st.session_state._last_conversation_agent_id = selected_agent_id
 
 
 def history_to_text(chat_history):
@@ -94,7 +117,77 @@ def get_response_stream(question: str):
 
 
 def send_telemetry(**kwargs):
-    pass  # TODO: implement
+    """Send lightweight telemetry for analytics/debugging.
+
+    Behavior:
+    - Disabled when env var `TELEMETRY_DISABLED` is set to true/1/yes.
+    - If `TELEMETRY_ENDPOINT` is set, POSTs JSON to that URL.
+      Optional API key may be passed via `TELEMETRY_API_KEY` (Bearer).
+    - If no endpoint is configured, appends events to `telemetry.log`
+      next to `app.py`.
+
+    To minimize accidental PII leakage we include only short snippets
+    and SHA256 hashes of `question` and `response` instead of full text.
+    """
+    try:
+        if os.getenv("TELEMETRY_DISABLED", "").lower() in ("1", "true", "yes"):
+            return
+
+        # Extract common fields
+        question = kwargs.get("question")
+        response = kwargs.get("response")
+        session_id = kwargs.get("session_id")
+        agent_id = kwargs.get("agent_id")
+
+        def _hash(s: Optional[str]) -> Optional[str]:
+            if s is None:
+                return None
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+        payload = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "question_hash": _hash(question),
+            "response_hash": _hash(response),
+            "question_snippet": (question[:200] + "…") if question and len(question) > 200 else question,
+            "response_snippet": (response[:200] + "…") if response and len(response) > 200 else response,
+            "question_length": len(question) if question else 0,
+            "response_length": len(response) if response else 0,
+        }
+
+        # copy any other non-sensitive kwargs
+        for k, v in kwargs.items():
+            if k in ("question", "response", "session_id", "agent_id"):
+                continue
+            payload[k] = v
+
+        endpoint = os.getenv("TELEMETRY_ENDPOINT")
+        api_key = os.getenv("TELEMETRY_API_KEY")
+
+        if endpoint:
+            data = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    # read response to complete request; ignore content
+                    _ = resp.read()
+            except Exception as exc:  # network/timeout errors should not break app
+                logging.getLogger(__name__).exception("Failed to send telemetry: %s", exc)
+        else:
+            # Fallback: append to local log file next to app.py
+            try:
+                log_path = os.path.join(os.path.dirname(__file__), "telemetry.log")
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                logging.getLogger(__name__).exception("Failed to write telemetry log: %s", exc)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Unexpected error in send_telemetry: %s", exc)
 
 
 def get_agent_status_snapshot(agent_id, force_refresh=False):
@@ -141,6 +234,12 @@ def render_sidebar():
     if agent_ids and st.session_state.get("selected_agent_id") not in agent_ids:
         st.session_state.selected_agent_id = agent_ids[0]
 
+    if (
+        st.session_state.get("_last_conversation_agent_id") is None
+        and st.session_state.get("selected_agent_id") in agent_ids
+    ):
+        st.session_state._last_conversation_agent_id = st.session_state.selected_agent_id
+
     message_count_placeholder = None
 
     with st.sidebar:
@@ -155,6 +254,7 @@ def render_sidebar():
             options=agent_ids,
             format_func=lambda aid: agent_labels.get(aid, aid),
             key="selected_agent_id",
+            on_change=handle_agent_platform_change,
         )
 
         refresh_connection = st.button(
@@ -333,6 +433,7 @@ if st.session_state.is_processing and st.session_state.processing_started_at:
     if elapsed.total_seconds() > PROCESSING_TIMEOUT_SECONDS:
         st.session_state.is_processing = False
         st.session_state.processing_started_at = None
+        st.session_state.pending_user_message = None
 
 sidebar_slots = render_sidebar()
 
@@ -349,14 +450,16 @@ user_just_clicked_suggestion = (
 )
 user_first_interaction = user_just_asked_initial_question or user_just_clicked_suggestion
 has_message_history = len(st.session_state.messages) > 0
+has_pending_user_message = bool(st.session_state.get("pending_user_message"))
+is_chat_input_blocked = st.session_state.is_processing or has_pending_user_message
 
 # Landing page (no messages yet)
-if not user_first_interaction and not has_message_history:
+if not user_first_interaction and not has_message_history and not has_pending_user_message:
     with st.container():
         st.chat_input(
             "Ask a question...",
             key="initial_question",
-            disabled=st.session_state.is_processing,
+            disabled=is_chat_input_blocked,
         )
         st.pills(
             label="Examples",
@@ -372,16 +475,27 @@ if not user_first_interaction and not has_message_history:
     st.stop()
 
 # Follow-up chat input
-user_message = st.chat_input(
+incoming_user_message = st.chat_input(
     "Ask a follow-up...",
-    disabled=st.session_state.is_processing,
+    disabled=is_chat_input_blocked,
 )
 
-if not user_message:
+if (
+    not incoming_user_message
+    and not is_chat_input_blocked
+):
     if user_just_asked_initial_question:
-        user_message = st.session_state.initial_question
+        incoming_user_message = st.session_state.initial_question
     if user_just_clicked_suggestion:
-        user_message = SUGGESTIONS[st.session_state.selected_suggestion]
+        incoming_user_message = SUGGESTIONS[st.session_state.selected_suggestion]
+
+if incoming_user_message and not is_chat_input_blocked:
+    st.session_state.pending_user_message = incoming_user_message
+    st.session_state.is_processing = True
+    st.session_state.processing_started_at = datetime.datetime.now()
+    st.session_state.initial_question = None
+    st.session_state.selected_suggestion = None
+    st.rerun()
 
 # Render chat history
 for message in st.session_state.messages:
@@ -390,13 +504,11 @@ for message in st.session_state.messages:
             st.container()  # fix ghost message bug
         st.markdown(message["content"])
 
-# Handle new user message
-if user_message:
-    st.session_state.is_processing = True
-    st.session_state.processing_started_at = datetime.datetime.now()
-
+# Handle queued user message
+pending_user_message = st.session_state.get("pending_user_message")
+if pending_user_message:
     try:
-        user_message = user_message.replace("$", r"\$")
+        user_message = pending_user_message.replace("$", r"\$")
 
         with st.chat_message("user"):
             st.markdown(user_message)
@@ -439,3 +551,6 @@ if user_message:
     finally:
         st.session_state.is_processing = False
         st.session_state.processing_started_at = None
+        st.session_state.pending_user_message = None
+
+    st.rerun()
